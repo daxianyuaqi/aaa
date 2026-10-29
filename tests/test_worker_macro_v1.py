@@ -19,6 +19,7 @@ from algorithms.hierarchical.option_conditional_dispatch import (
     LEARNED_PHASES,
     RULE_PHASES,
     assert_no_search_leak,
+    merge_hybrid_actions,
 )
 from algorithms.hierarchical.per_agent_credit import (
     apply_protocol_credit,
@@ -42,7 +43,12 @@ from algorithms.hierarchical.worker_contract import (
     ppo_action_spec,
 )
 from algorithms.mappo.distributions import MaskedBernoulli, SquashedDiagonalGaussian
-from formation_hrl.baselines import rule_worker_action, set_host_rule_worker
+from formation_hrl.baselines import WSL_OVERWRITE_FORBIDDEN, rule_worker_action
+from formation_hrl.rule_worker_hook import (
+    a0_rule_worker_action,
+    rule_worker_action as hooked_rule_worker_action,
+    set_host_rule_worker,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 DOC = ROOT / "docs" / "protocols" / "learned_worker" / "worker_macro_v1.md"
@@ -56,6 +62,8 @@ class _View:
 
 def _policy(contract: WorkerContract | None = None) -> WorkerPolicy:
     scale = torch.tensor([1.0, 0.5, 30.0])
+    if contract is None:
+        contract = WorkerContract.macro_v1()
     return WorkerPolicy(8, 4, scale, hidden_sizes=(16, 16), contract=contract)
 
 
@@ -211,7 +219,6 @@ def test_compose_keeps_rule_motion_and_masked_fire() -> None:
     phases = ["SEARCH", "POSITION", "FIRE", "DEFEND"]
     view = _View(phases)
     rule_c, rule_f, rule_s = rule_worker_action(view)
-    assert rule_worker_action.last_source == "fallback_not_a0"
     assert not bool(rule_f.any())
     gate = resolve_fire_mask(
         [False, False, True, False],
@@ -284,8 +291,6 @@ def test_launch_gate_never_widens_the_env_mask() -> None:
 
 
 def test_legacy_merge_still_learns_motion_and_scan() -> None:
-    from algorithms.hierarchical.option_conditional_dispatch import merge_hybrid_actions
-
     phases = ["SEARCH", "POSITION", "FIRE"]
     rule_c = [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
     learned_c = [[9.0, 9.0, 9.0], [2.0, 3.0, 4.0], [5.0, 6.0, 7.0]]
@@ -297,7 +302,6 @@ def test_legacy_merge_still_learns_motion_and_scan() -> None:
         learned_continuous=learned_c,
         learned_fire=[False, True, True],
         learned_scan=[0, 1, 1],
-        contract=WorkerContract.legacy_116(),
     )
     assert continuous[0].tolist() == [1.0, 0.0, 0.0]
     assert continuous[1].tolist() == [2.0, 3.0, 4.0]
@@ -307,11 +311,27 @@ def test_legacy_merge_still_learns_motion_and_scan() -> None:
     assert list(learned) == [False, True, True]
     assert_no_search_leak(phases, learned)
     assert LEARNED_PHASES == frozenset({"POSITION", "FIRE"})
-    assert "DEFEND" in RULE_PHASES and "SEARCH" in RULE_PHASES
+    assert RULE_PHASES == frozenset({"SEARCH", "DEFEND"})
+    assert "ALERT" not in RULE_PHASES
+    try:
+        merge_hybrid_actions(
+            phases=["ALERT"],
+            rule_continuous=[[0.0, 0.0, 0.0]],
+            rule_fire=[False],
+            rule_scan=[0],
+            learned_continuous=[[0.0, 0.0, 0.0]],
+            learned_fire=[False],
+            learned_scan=[0],
+        )
+    except ValueError as exc:
+        assert "ALERT" in str(exc)
+    else:
+        raise AssertionError("ALERT is not a 116 phase")
 
 
 def test_host_rule_worker_is_not_rewritten() -> None:
     seen = {}
+    original = rule_worker_action
 
     def host(env):
         seen["phases"] = list(env.phase)
@@ -324,14 +344,17 @@ def test_host_rule_worker_is_not_rewritten() -> None:
 
     set_host_rule_worker(host)
     try:
-        continuous, fire, scan = rule_worker_action(_View(["FIRE"]))
+        continuous, fire, scan = hooked_rule_worker_action(_View(["FIRE"]))
+        assert hooked_rule_worker_action.last_source == "host"
+        assert list(continuous[0]) == [0.25, 0.0, 1.0]
+        assert bool(fire[0]) is True
+        assert int(scan[0]) == 1
+        assert seen["phases"] == ["FIRE"]
+        untouched, _, _ = rule_worker_action(_View(["FIRE"]))
+        assert list(untouched[0]) != [0.25, 0.0, 1.0]
+        assert rule_worker_action is original
     finally:
         set_host_rule_worker(None)
-    assert rule_worker_action.last_source == "host"
-    assert list(continuous[0]) == [0.25, 0.0, 1.0]
-    assert bool(fire[0]) is True
-    assert int(scan[0]) == 1
-    assert seen["phases"] == ["FIRE"]
 
 
 def test_116_terminal_credit_is_unchanged() -> None:
@@ -471,3 +494,138 @@ def test_archive_lock_is_in_the_contract_doc() -> None:
     assert "learn_fire_only" in text
     assert "learn_scan" in text
     assert "continuous_dims" in text
+    apply = (ROOT / "docs" / "protocols" / "learned_worker" / "WSL_APPLY.md").read_text(encoding="utf-8")
+    assert "不要覆盖" in apply
+    assert "option_conditional_dispatch.py" in apply
+    assert "baselines.py" in apply
+    assert "assemble_hybrid_action" in apply
+    assert "env.step" in apply
+    assert "tests/test_worker_macro_v1.py" in apply
+
+
+def test_unspecified_policy_keeps_the_116_joint_density() -> None:
+    scale = torch.tensor([1.0, 0.5, 30.0])
+    policy = WorkerPolicy(8, 4, scale, hidden_sizes=(16, 16))
+    assert policy.contract.is_legacy
+    calls = {"gauss": 0, "bern": 0}
+    orig_g = SquashedDiagonalGaussian.sample
+    orig_b = MaskedBernoulli.sample
+
+    def gsample(self, generator, dims=None):
+        calls["gauss"] += 1
+        return orig_g(self, generator, dims=dims)
+
+    def bsample(self, generator):
+        calls["bern"] += 1
+        return orig_b(self, generator)
+
+    SquashedDiagonalGaussian.sample = gsample  # type: ignore[method-assign]
+    MaskedBernoulli.sample = bsample  # type: ignore[method-assign]
+    try:
+        action = policy.act(
+            _obs(),
+            torch.ones(4, dtype=torch.bool),
+            generator=torch.Generator().manual_seed(5),
+        )
+    finally:
+        SquashedDiagonalGaussian.sample = orig_g  # type: ignore[method-assign]
+        MaskedBernoulli.sample = orig_b  # type: ignore[method-assign]
+    assert calls == {"gauss": 1, "bern": 2}
+    assert action.learned_components == (
+        "delta_course",
+        "flight_path",
+        "delta_speed",
+        "fire",
+        "scan",
+    )
+
+
+def test_hook_delegates_to_a0_without_rewriting_it() -> None:
+    import formation_hrl.baselines as baselines
+
+    try:
+        a0_rule_worker_action(_View(["FIRE"]))
+    except RuntimeError as exc:
+        assert "not WSL A0" in str(exc)
+    else:
+        raise AssertionError("the test fallback must not run as A0")
+    assert WSL_OVERWRITE_FORBIDDEN is True
+    course = [[4.0, 5.0, 6.0]]
+    fired = [True]
+    scan = [1]
+
+    def real_a0(env):
+        return course, fired, scan
+
+    previous = baselines.rule_worker_action
+    baselines.rule_worker_action = real_a0
+    set_host_rule_worker(lambda env: ("host-override",))
+    try:
+        got = a0_rule_worker_action(_View(["SEARCH"]))
+        assert got[0] is course and got[1] is fired and got[2] is scan
+        assert hooked_rule_worker_action(_View(["SEARCH"])) == ("host-override",)
+        set_host_rule_worker(None)
+        restored = hooked_rule_worker_action(_View(["SEARCH"]))
+        assert restored[0] is course and restored[1] is fired and restored[2] is scan
+        assert hooked_rule_worker_action.last_source == "a0"
+    finally:
+        baselines.rule_worker_action = previous
+        set_host_rule_worker(None)
+
+
+def test_alert_phase_stays_unknown_for_credit() -> None:
+    from algorithms.hierarchical.per_agent_credit import is_learned_step
+
+    try:
+        is_learned_step({"phase": "ALERT"})
+    except ValueError as exc:
+        assert "ALERT" in str(exc)
+    else:
+        raise AssertionError("ALERT must stay outside LEARNED_PHASES and RULE_PHASES")
+
+
+def test_assemble_hybrid_action_does_not_step_the_env() -> None:
+    from algorithms.hierarchical import option_conditional_dispatch as dispatch
+    from experiments.hybrid_contract_step import assemble_hybrid_action
+
+    class Env:
+        def __init__(self) -> None:
+            self.phase = ["SEARCH", "FIRE"]
+            self.stepped = False
+
+        def step(self, *_args, **_kwargs):
+            self.stepped = True
+            raise AssertionError("env.step")
+
+    class Snap:
+        phase = ["SEARCH", "FIRE"]
+        fire_mask = [False, True]
+        worker_observation = [[0.0] * 8, [0.0] * 8]
+
+    env = Env()
+    bare = WorkerPolicy(8, 4, torch.tensor([1.0, 0.5, 30.0]), hidden_sizes=(16, 16))
+    assert bare.contract.is_legacy
+    assembled = assemble_hybrid_action(
+        env,
+        Snap(),
+        bare,
+        generator=torch.Generator().manual_seed(6),
+        deterministic=True,
+    )
+    assert bare.contract.worker_contract == "macro_v1"
+    assert env.stepped is False
+    assert assembled.contract_name == "macro_v1"
+    assert assembled.learned_components == ("fire",)
+    assert list(assembled.learned_mask) == [False, True]
+    assert assembled.continuous[0].tolist() == [0.4, 0.0, 0.0]
+    assert assembled.continuous[1].tolist() == [0.0, 0.0, 0.0]
+    assert bool(assembled.fire[0]) is False
+    source = getattr(dispatch, "HYBRID_DISPATCH_ID_SOURCE", "wsl_module")
+    assert assembled.dispatch_id == dispatch.HYBRID_DISPATCH_ID
+    assert assembled.dispatch_id_source == source
+    if source == "placeholder_drop_in_omitted_wsl_module":
+        assert assembled.dispatch_id == "option_conditional_hybrid_v1"
+    else:
+        assert source == "wsl_module"
+        assert assembled.dispatch_id
+

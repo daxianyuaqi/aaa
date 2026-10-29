@@ -2,10 +2,10 @@
 
 Actors receive only legal observations. Critics alone receive centralized state.
 
-``worker_macro_v1`` (the default contract) puts only masked fire, plus an
-optional heading bin, into the joint density. Scan and the remaining
-continuous channels stay on the rule macro and are not sampled. ``legacy_116``
-restores the original 3-continuous + fire + scan density.
+Constructing ``WorkerPolicy`` without a contract keeps the 116 joint density
+(3 continuous + fire + scan) so dropping this file onto the WSL tree does not
+retarget an existing smoke run. ``compose_hybrid_step`` passes
+``worker_macro_v1`` from the yaml, and that path samples masked fire only.
 """
 
 from __future__ import annotations
@@ -16,10 +16,7 @@ from typing import Sequence
 import torch
 from torch import Tensor, nn
 
-from algorithms.hierarchical.worker_contract import (
-    WorkerContract,
-    default_worker_contract,
-)
+from algorithms.hierarchical.worker_contract import WorkerContract
 from algorithms.mappo.distributions import MaskedBernoulli, SquashedDiagonalGaussian
 
 MANAGER_POLICY_ID = "bvr_formation_manager_ctde_ppo_v1"
@@ -126,7 +123,9 @@ class WorkerPolicy(nn.Module):
             raise ValueError("initial log std is outside the supported range")
         self.observation_size = int(observation_size)
         self.critic_state_size = int(critic_state_size)
-        self.contract = default_worker_contract() if contract is None else contract
+        # None keeps the 116 joint density. The yaml contract is applied by
+        # compose_hybrid_step / assemble_hybrid_action, not by this default.
+        self.contract = WorkerContract.legacy_116() if contract is None else contract
         self.actor_trunk, actor_width = _mlp(observation_size, hidden_sizes)
         self.mean_head = nn.Linear(actor_width, 3)
         self.fire_head = nn.Linear(actor_width, 1)
@@ -175,29 +174,28 @@ class WorkerPolicy(nn.Module):
         fire_mask: Tensor,
         *,
         contract: WorkerContract | None = None,
-    ) -> tuple[SquashedDiagonalGaussian | None, MaskedBernoulli | None, MaskedBernoulli | None]:
+    ) -> tuple[SquashedDiagonalGaussian, MaskedBernoulli, MaskedBernoulli]:
+        """Always return the three 116 factors so existing callers can unpack them.
+
+        ``contract`` decides which factors ``act`` / ``evaluate_actions`` /
+        ``hybrid_kl`` actually sample and score. Unscored factors are still
+        built so the module signature matches the WSL policy.
+        """
+        del contract
         if observation.shape[-1] != self.observation_size:
             raise ValueError("worker observation width differs from policy")
         if fire_mask.shape != observation.shape[:-1]:
             raise ValueError("fire mask shape differs from worker batch")
-        spec = self._spec(contract)
         hidden = self.actor_trunk(observation)
-        continuous = None
-        fire = None
-        scan = None
-        if spec.scores_continuous:
-            mean = self.mean_head(hidden)
-            continuous = SquashedDiagonalGaussian(
-                mean, self.log_std.expand_as(mean), self.action_scale
-            )
-        if spec.scores_fire:
-            fire = MaskedBernoulli(self.fire_head(hidden).squeeze(-1), fire_mask.bool())
-        if spec.scores_scan:
-            # Both scan modes are legal for an active sensor on the legacy path.
-            scan = MaskedBernoulli(
-                self.scan_head(hidden).squeeze(-1),
-                torch.ones_like(fire_mask, dtype=torch.bool),
-            )
+        mean = self.mean_head(hidden)
+        continuous = SquashedDiagonalGaussian(
+            mean, self.log_std.expand_as(mean), self.action_scale
+        )
+        fire = MaskedBernoulli(self.fire_head(hidden).squeeze(-1), fire_mask.bool())
+        scan = MaskedBernoulli(
+            self.scan_head(hidden).squeeze(-1),
+            torch.ones_like(fire_mask, dtype=torch.bool),
+        )
         return continuous, fire, scan
 
     def _score(
@@ -244,23 +242,26 @@ class WorkerPolicy(nn.Module):
         continuous_dist, fire_dist, scan_dist = self.distribution(
             observation, fire_mask, contract=spec
         )
-        if continuous_dist is None:
+        if not spec.scores_continuous:
             pre_squash = _zeros_like_batch(observation, 3)
             continuous = pre_squash
         elif deterministic:
             pre_squash = continuous_dist.mean
             continuous = continuous_dist.mode()
+        elif spec.is_legacy:
+            # Real WSL SquashedDiagonalGaussian.sample(generator) has no dims.
+            pre_squash, continuous = continuous_dist.sample(generator)
         else:
             pre_squash, continuous = continuous_dist.sample(
                 generator, dims=spec.continuous_dim_index()
             )
-        if fire_dist is None:
+        if not spec.scores_fire:
             fire = torch.zeros(observation.shape[:-1], device=observation.device, dtype=observation.dtype)
         elif deterministic:
             fire = fire_dist.mode()
         else:
             fire = fire_dist.sample(generator)
-        if scan_dist is None:
+        if not spec.scores_scan:
             scan = torch.zeros_like(fire)
         elif deterministic:
             scan = scan_dist.mode()
