@@ -1,8 +1,15 @@
-"""Hybrid phase sets and ``merge_hybrid_actions``.
+"""116-shaped hybrid dispatcher stand-in.
 
-``LEARNED_PHASES`` / ``RULE_PHASES`` keep the 116 names. Which components
-inside POSITION/FIRE are PPO-owned is decided by ``WorkerContract``.
-SEARCH, DEFEND, and ALERT never take a learned component.
+Do not copy this file onto WSL ``2v1new``. ``APPLY.md`` in the L1+L3 drop-in
+says ``option_conditional_dispatch.py`` stays the copy already on disk, and
+that copy was not included in the drop-in, so its ``HYBRID_DISPATCH_ID``
+string is not known here.
+
+``merge_hybrid_actions`` matches the smoke keyword signature and does not
+take a contract. Macro v1 is applied afterwards by
+``contract_merge.apply_worker_contract_actions``. Phase names match the
+credit tests: ``POSITION``/``FIRE`` are learned, ``SEARCH``/``DEFEND`` are
+rule, and ``ALERT`` is not a phase (it raises).
 """
 
 from __future__ import annotations
@@ -11,21 +18,36 @@ from typing import Sequence
 
 import numpy as np
 
-from algorithms.hierarchical.worker_contract import (
-    WorkerContract,
-    default_worker_contract,
-)
-
+# Placeholder only. On WSL, read the real constant and do not overwrite it.
+# Replacement point: this assignment, and the smoke report field ``dispatch_id``.
+HYBRID_DISPATCH_ID_SOURCE = "placeholder_drop_in_omitted_wsl_module"
 HYBRID_DISPATCH_ID = "option_conditional_hybrid_v1"
-# TODO(2v1new): the drop-in imports this symbol but not its string. When the
-# WSL module is mounted, re-export that module's HYBRID_DISPATCH_ID unchanged.
 
 LEARNED_PHASES = frozenset({"POSITION", "FIRE"})
-RULE_PHASES = frozenset({"SEARCH", "DEFEND", "ALERT"})
+RULE_PHASES = frozenset({"SEARCH", "DEFEND"})
 
 
 def _phase(name: object) -> str:
     return str(name).strip().upper()
+
+
+def learned_agent_mask(phases: Sequence[object]) -> np.ndarray:
+    """Per-aircraft learned bit. Same phase rule as ``is_learned_step``.
+
+    A phase outside the two sets raises. ``ALERT`` is one of those unknown
+    names in the 116 credit tests; alert formation is an environment flag,
+    not a dispatcher phase.
+    """
+    mask = np.zeros(len(phases), dtype=bool)
+    for index, phase in enumerate(phases):
+        normalized = _phase(phase)
+        if normalized in LEARNED_PHASES:
+            mask[index] = True
+        elif normalized in RULE_PHASES:
+            mask[index] = False
+        else:
+            raise ValueError(f"unknown worker phase {normalized!r}")
+    return mask
 
 
 def assert_no_search_leak(phases: Sequence[object], learned_mask: Sequence[bool]) -> None:
@@ -49,18 +71,16 @@ def merge_hybrid_actions(
     learned_continuous,
     learned_fire,
     learned_scan,
-    contract: WorkerContract | None = None,
 ):
-    """Blend rule and learned commands.
+    """116 blend. Learned phases take the PPO command; rule phases stay rule.
 
-    Returns ``continuous, fire, scan, learned_mask``. Under ``macro_v1`` the
-    continuous command and scan bit stay on the rule arrays. Fire is the
-    learned bit only on FIRE. POSITION/SEARCH/DEFEND/ALERT force fire to 0
-    on this hybrid path. ``legacy_116`` copies all three learned components
-    on POSITION and FIRE and leaves rule phases untouched, including rule fire.
+    Returns ``continuous, fire, scan, learned_mask``. This function does not
+    know about ``worker_macro_v1``. Callers that need the contract use
+    ``apply_worker_contract_actions``, which leaves this path unchanged for
+    ``legacy_116``.
     """
-    spec = default_worker_contract() if contract is None else contract
     phase_names = [_phase(phase) for phase in phases]
+    learned_agent_mask(phase_names)
     n = len(phase_names)
     continuous = np.array(rule_continuous, dtype=np.float64, copy=True)
     fire = np.array(rule_fire, dtype=bool, copy=True)
@@ -74,30 +94,11 @@ def merge_hybrid_actions(
         raise ValueError("fire and scan must have one entry per aircraft")
     if learned_f.shape != (n,) or learned_s.shape != (n,):
         raise ValueError("learned fire and scan must have one entry per aircraft")
-    learned_mask = np.zeros(n, dtype=bool)
+    learned_mask = learned_agent_mask(phase_names)
     for index, phase in enumerate(phase_names):
-        if phase not in LEARNED_PHASES and phase not in RULE_PHASES:
-            raise ValueError(f"unknown worker phase {phase!r}")
-        if phase in RULE_PHASES:
-            if not spec.is_legacy:
-                fire[index] = False
+        if phase not in LEARNED_PHASES:
             continue
-        if spec.is_legacy:
-            continuous[index] = learned_c[index]
-            fire[index] = bool(learned_f[index])
-            scan[index] = int(learned_s[index])
-            learned_mask[index] = True
-            continue
-        took = False
-        for dim in spec.continuous_dim_index():
-            if phase in spec.ppo_phases():
-                continuous[index, dim] = learned_c[index, dim]
-                took = True
-        if spec.scores_fire and phase == "FIRE":
-            fire[index] = bool(learned_f[index])
-            took = True
-        else:
-            fire[index] = False
-        # scan is intentionally left on the rule value
-        learned_mask[index] = took
+        continuous[index] = learned_c[index]
+        fire[index] = bool(learned_f[index])
+        scan[index] = int(learned_s[index])
     return continuous, fire, scan, learned_mask

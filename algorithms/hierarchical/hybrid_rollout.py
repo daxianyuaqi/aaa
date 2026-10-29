@@ -12,11 +12,9 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from algorithms.hierarchical.contract_merge import apply_worker_contract_actions
 from algorithms.hierarchical.launch_gate import LaunchGateBatch
-from algorithms.hierarchical.option_conditional_dispatch import (
-    assert_no_search_leak,
-    merge_hybrid_actions,
-)
+from algorithms.hierarchical.option_conditional_dispatch import assert_no_search_leak
 from algorithms.hierarchical.policy import WorkerAction, WorkerPolicy
 from algorithms.hierarchical.worker_contract import WorkerContract, default_worker_contract
 
@@ -34,6 +32,7 @@ class HybridCommand:
     gate_reason: tuple[str, ...]
     contract_name: str
     gate_source: str
+    action: WorkerAction
 
 
 def compose_hybrid_step(
@@ -67,7 +66,7 @@ def compose_hybrid_step(
     )
     if action.learned_components != spec.learned_components():
         raise RuntimeError("policy sampled a density the contract does not own")
-    continuous, fire, scan, learned_mask = merge_hybrid_actions(
+    continuous, fire, scan, learned_mask = apply_worker_contract_actions(
         phases=phases,
         rule_continuous=rule_continuous,
         rule_fire=rule_fire,
@@ -90,4 +89,5 @@ def compose_hybrid_step(
         gate_reason=gate.gate_reason,
         contract_name=spec.worker_contract,
         gate_source=gate.source,
+        action=action,
     )

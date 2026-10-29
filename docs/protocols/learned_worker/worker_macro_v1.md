@@ -8,19 +8,29 @@
 
 本 Git 树（`daxianyuaqi/aaa`）没有挂载 WSL `2v1new` 的 `bvr_sim` / `FormationDecisionEnvironment`。drop-in 里有 `policy.py`、`per_agent_credit.py`、`learned_worker_v0_smoke.py` 的调用形状，但 **没有** `option_conditional_dispatch.py` 和 `formation_hrl/baselines.py` 的函数体。
 
-| 本仓路径 | WSL `2v1new` | 本 PR |
+| 本仓路径 | WSL `2v1new` | 拷贝？ |
 |---|---|---|
-| `algorithms/hierarchical/policy.py` | 同路径 `WorkerPolicy` | 保留 3+fire+scan 头；密度由契约裁剪 |
-| `algorithms/hierarchical/option_conditional_dispatch.py` | 全量树已有；drop-in 未带字符串 | 按 smoke 的 `merge_hybrid_actions` / `assert_no_search_leak` 签名补最小实现 |
-| `algorithms/hierarchical/per_agent_credit.py` | 同路径 | 116 挂步逻辑原样；末尾 `apply_protocol_credit` 转 118b |
-| `algorithms/hierarchical/launch_gate.py` | 现网无统一 `LaunchGateService` | **唯一** `resolve_fire_mask` 入口 |
-| `algorithms/hierarchical/hybrid_rollout.py` | smoke 里 `policy.act` + `merge_hybrid_actions` 那段 | `compose_hybrid_step`，**不**调用 `env.step` |
-| `formation_hrl/baselines.py` | `rule_worker_action` = A0 | 有 host 则原样委托；无 host 时测试宏回退，**不是 A0** |
-| `experiments/learned_worker_v0_smoke.py` | 训练入口 | **未复制**。依赖仿真，且 `main()` 会开跑 |
-| `experiments/learned_worker_v0_phase_a.py` | 640k × 6 seed | **未复制、不启动** |
-| `bvr_sim`、yaml 场景、JSBSim/autopilot | 全量树 | **缺口**。运动学只锁文档 |
+| `algorithms/hierarchical/policy.py` | 同路径。未传 `contract` 时仍是 116 的 3+fire+scan 联合密度 | **整文件替换**（先备份）。新 rollout 才传入 `macro_v1` |
+| `algorithms/hierarchical/per_agent_credit.py` | 同路径。`flush_open_trajectories` 未改 | **整文件替换**（末尾多 `apply_protocol_credit`） |
+| `algorithms/hierarchical/option_conditional_dispatch.py` | 真树已有；drop-in 未收录，`APPLY.md` 要求留在磁盘上 | **不要覆盖**。本仓文件只是单测替身 |
+| `formation_hrl/baselines.py` | `rule_worker_action` = A0 | **不要覆盖**。本仓副本标了 `WSL_OVERWRITE_FORBIDDEN` |
+| `formation_hrl/rule_worker_hook.py` | 无此文件 | **新增**。默认调用真 A0，返回值不改写 |
+| `algorithms/hierarchical/contract_merge.py` | 无 | **新增**。`legacy_116` 直接调用真 `merge_hybrid_actions` |
+| `algorithms/hierarchical/hybrid_rollout.py` | 无 | **新增**。`compose_hybrid_step` |
+| `experiments/hybrid_contract_step.py` | 无 | **新增**。smoke 改为调用 `assemble_hybrid_action`；**不**调用 `env.step` |
+| `algorithms/hierarchical/launch_gate.py` 等契约模块、yaml、docs、`tests/test_worker_macro_v1.py` | 无 | **新增** |
+| `experiments/learned_worker_v0_smoke.py` | 训练入口 | **不整文件替换**。只打 `WSL_APPLY.md` 里的两处调用 |
+| `bvr_sim` / 场景 yaml | 全量树 | **缺口**，不动 |
 
-`HYBRID_DISPATCH_ID = "option_conditional_hybrid_v1"` 是本仓占位。WSL 模块里的原字符串不在 drop-in 中，接回全量树时改为 re-export，不要并存两套 dispatcher。
+相位集合与 116 信用测试一致：`LEARNED_PHASES = {POSITION, FIRE}`，`RULE_PHASES = {SEARCH, DEFEND}`。`ALERT` **不是**相位名（`is_learned_step` 会报错）。警戒是环境标志 `alert_formation_hold`，由 A0 规则 Worker 消化。
+
+`HYBRID_DISPATCH_ID` 的原字符串不在 drop-in 里。本仓替身是 `option_conditional_hybrid_v1`，来源标记 `placeholder_drop_in_omitted_wsl_module`。不要用这个占位覆盖真模块。合入后在 WSL 上打印真值：
+
+```bash
+python -c "from algorithms.hierarchical.option_conditional_dispatch import HYBRID_DISPATCH_ID; print(repr(HYBRID_DISPATCH_ID))"
+```
+
+拷贝步骤、smoke 最小 diff 和验收命令见 `docs/protocols/learned_worker/WSL_APPLY.md`。
 
 ## 2. 上层三任务
 
@@ -32,9 +42,9 @@
 | **发射** | FIRE，且 `launch_gate ≥ ADVISORY` | 几何继续规则宏；默认只有 masked fire 可学 | FIRE 的 fire 位可学；不是 Manager PPO |
 | **DEFEND / 警戒** | DEFEND、`alert_formation_hold`、`defend=beam_always` | **规则抢占**。可打断搜索·占位和发射，结束后回搜索·占位 | **不是 PPO option**。不进 `LEARNED_PHASES` 的可学分量 |
 
-`LEARNED_PHASES = {POSITION, FIRE}` 与 `RULE_PHASES = {SEARCH, DEFEND, ALERT}` 仍是 116 的相位名字。契约决定这些相位里哪些分量进 PPO，而不是再造一套相位字符串。
+`LEARNED_PHASES = {POSITION, FIRE}`，`RULE_PHASES = {SEARCH, DEFEND}`。这是 116 相位集合，不是上层 option 集合。契约只裁这些相位里哪些分量进 PPO。
 
-`assert_no_search_leak` 保留：SEARCH / DEFEND / ALERT 上 `learned_mask` 必须为假。
+`assert_no_search_leak` 保留：SEARCH / DEFEND 上 `learned_mask` 必须为假。`ALERT` 会直接报未知相位。
 
 ## 3. 动作表（`worker_contract: macro_v1`）
 
