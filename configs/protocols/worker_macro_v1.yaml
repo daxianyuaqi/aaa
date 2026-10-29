@@ -1,0 +1,17 @@
+# Default Worker contract: scheme ② (rule macro + masked fire).
+# Rollback to the frozen 116 joint density with worker_contract: legacy_116
+# via WorkerContract.legacy_116(). Do not start training from this file.
+worker_contract: macro_v1
+learn_fire_only: true
+learn_scan: false
+learn_continuous: false
+continuous_dims: 0
+learn_heading_only: false
+credit_rewrite: none
+illegal_fire_shaping: false
+selection_118a:
+  enabled: false
+  mid_eval_first: 998064
+  mid_eval_every: 20000
+  mid_eval_cases: 16
+  min_win_for_best: 0.125
